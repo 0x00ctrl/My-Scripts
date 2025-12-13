@@ -13,33 +13,24 @@
 # make sure to give executable permission to this script ->  chmod u+x fvs.sh
 # and place this file inside any directory listed in your PATH environment variable to run it from your present working directory, no need to ./fvs.sh 
 
-#!/usr/bin/env bash
+#!/bin/bash
+# wrapper script for preview searching files using fzf
+
+if [[ "$1" == "nano" || "$1" == "micro" || "$1" == "vim" || "$1" == "mousepad" ]]; then
+ 	$1 $(fzf --reverse --preview "cat {}")
+    exit 1
+fi
 
 if [ $# -eq 0 ]; then
         fzf --reverse --preview "cat {}"
         exit 1
 elif [ $# -eq 1 ]; then
-	prow=$1
-	if [ "$prow" == "nano" ]; then
-		nano "$(fzf --reverse --preview "cat {}")"
-		exit 1
-	elif [ "$prow" == "vim" ]; then
-                vim "$(fzf --reverse --preview "cat {}")"
-		exit 1
-	elif [ "$prow" == "nvim" ]; then
-                nvim "$(fzf --reverse --preview "cat {}")"
-		exit 1	
-	elif [ "$prow" == "mousepad" ]; then
-                mousepad "$(fzf --reverse --preview "cat {}")"
-		exit 1
-	else
-        	dir_path=$1
-        	if [ -d "$dir_path" ]; then
-                	fzf --reverse --walker-root=$dir_path --preview "cat {}"
-                	exit 1
-        	else
-                	echo "Look at what u typed...."
-                	exit 1
-        	fi
-	fi
+        dir_path=$1
+        if [ -d "$dir_path" ]; then
+                fzf --reverse --walker-root=$dir_path --preview "cat {}"
+                exit 1
+        else
+                echo "Invalid Directory!!"
+                exit 1
+        fi
 fi
