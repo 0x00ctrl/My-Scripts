@@ -1,0 +1,6 @@
+#simple bash script for downloading the mp3 of any youtube video, short, insta reel etc. Prereq: yt-dlp (install this first using your distro package manager)
+#Usage: ytmp3 <url>
+#make this script executable and place in your /usr/local/bin or any directory which is in $PATH so you can use it from anywhere easily ;)
+
+#!/bin/bash
+yt-dlp -x --audio-format mp3 --audio-quality 0 -o '%(title)s.%(ext)s' $1
