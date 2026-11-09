@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+#
+# igdl.sh - yt-dlp wrapper that produces WhatsApp-friendly video files
+# Requires: yt-dlp, ffmpeg (provides ffprobe)
+#
+set -euo pipefail
+
+readonly VERSION="1.0.0"
+readonly WA_MAX_MB=64          # warn if output exceeds this size
+
+# ---------- defaults ----------
+OUTDIR="."
+NAME=""                        # custom base filename (no extension)
+PREFIX=""                      # prefix for auto-generated names
+WHATSAPP=0                     # re-encode to WhatsApp-safe H.264/AAC mp4
+AUDIO_ONLY=0                   # extract audio only (mp3)
+MAX_HEIGHT=""                  # cap resolution, e.g. 720
+CRF=23                         # x264 quality (lower = better, larger)
+FORMAT="bv*+ba/b"              # yt-dlp format selector
+COOKIES=""                     # browser name for --cookies-from-browser
+KEEP_ORIGINAL=0                # keep the pre-conversion file
+DRY_RUN=0
+VERBOSE=0
+INPUT_FILE=""
+URLS=()
+
+# ---------- helpers ----------
+log()  { printf '[igdl] %s\n' "$*" >&2; }
+warn() { printf '[igdl] WARNING: %s\n' "$*" >&2; }
+die()  { printf '[igdl] ERROR: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+cat <<EOF
+igdl.sh v${VERSION} - download Instagram/other reels, WhatsApp-ready
+
+Usage: $0 [options] URL [URL...]
+
+Output:
+  -o DIR        output directory (default: current dir)
+  -n NAME       custom filename, no extension (multiple URLs get _01, _02...)
+  -p PREFIX     prefix for auto-generated filenames
+  -k            keep original file when converting (-w)
+
+Encoding:
+  -w            WhatsApp mode: convert to H.264/AAC mp4, yuv420p, faststart
+  -r HEIGHT     cap resolution (e.g. 720) and scale down when converting
+  -q CRF        x264 quality for conversion, 18-28 (default: ${CRF})
+  -a            audio only (mp3)
+
+Download:
+  -F FORMAT     yt-dlp format selector (default: "${FORMAT}")
+  -c BROWSER    cookies from browser: chrome, firefox, brave, edge...
+  -i FILE       read URLs from FILE (one per line, # for comments)
+
+Misc:
+  -d            dry run (print yt-dlp commands only)
+  -v            verbose yt-dlp output
+  -V            print version
+  -h            show this help
+
+Examples:
+  $0 -w "https://www.instagram.com/reel/XXXX/"
+  $0 -w -n "birthday_clip" -o ~/Videos "https://www.instagram.com/reel/XXXX/"
+  $0 -w -r 720 -c chrome -i urls.txt
+  $0 -a "https://www.instagram.com/reel/XXXX/"
+EOF
+}
+
+size_mb() { echo $(( $(wc -c < "$1") / 1048576 )); }
+
+check_deps() {
+  command -v yt-dlp >/dev/null 2>&1 || die "yt-dlp not found (pip install -U yt-dlp)"
+  if (( WHATSAPP )) && (( ! AUDIO_ONLY )); then
+    command -v ffmpeg  >/dev/null 2>&1 || die "ffmpeg not found (needed for -w)"
+    command -v ffprobe >/dev/null 2>&1 || die "ffprobe not found (needed for -w)"
+  fi
+}
+
+# Convert a downloaded file into a WhatsApp-safe mp4. Prints the final path on stdout.
+to_whatsapp() {
+  local in="$1" out vcodec pix acodec
+  out="${in%.*}.wa.mp4"
+
+  vcodec=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$in" 2>/dev/null || true)
+  pix=$(ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt -of csv=p=0 "$in" 2>/dev/null || true)
+  acodec=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$in" 2>/dev/null || true)
+
+  local -a venc aenc
+  if [[ "$vcodec" == "h264" && "$pix" == "yuv420p" && -z "$MAX_HEIGHT" ]]; then
+    venc=(-c:v copy)                       # already compatible, just remux
+  else
+    venc=(-c:v libx264 -preset medium -crf "$CRF" -profile:v high -level 4.1 -pix_fmt yuv420p)
+    [[ -n "$MAX_HEIGHT" ]] && venc+=(-vf "scale=-2:'min(ih,${MAX_HEIGHT})'")
+  fi
+
+  if [[ "$acodec" == "aac" || -z "$acodec" ]]; then
+    aenc=(-c:a copy)
+  else
+    aenc=(-c:a aac -b:a 128k -ac 2)
+  fi
+
+  log "converting for WhatsApp (video: ${vcodec:-unknown}/${pix:-?}, audio: ${acodec:-none})..."
+  if ! ffmpeg -hide_banner -loglevel error -nostdin -y -i "$in" \
+        -map 0:v:0 -map "0:a?" "${venc[@]}" "${aenc[@]}" \
+        -movflags +faststart "$out" >&2; then
+    warn "ffmpeg conversion failed, keeping original: $in"
+    rm -f "$out"
+    echo "$in"
+    return 0
+  fi
+
+  (( KEEP_ORIGINAL )) || rm -f "$in"
+  echo "$out"
+}
+
+process_url() {
+  local url="$1" idx="$2" base tmpl file
+  local -a cmd
+
+  if [[ -n "$NAME" ]]; then
+    base="$NAME"
+    (( ${#URLS[@]} > 1 )) && base="${NAME}_$(printf '%02d' "$idx")"
+    tmpl="${OUTDIR}/${base}.%(ext)s"
+  else
+    tmpl="${OUTDIR}/${PREFIX}%(title).60s [%(id)s].%(ext)s"
+  fi
+
+  cmd=(yt-dlp --no-playlist --restrict-filenames --no-overwrites --progress -o "$tmpl")
+
+  if (( AUDIO_ONLY )); then
+    cmd+=(-x --audio-format mp3 --audio-quality 0)
+  else
+    cmd+=(-f "$FORMAT" --merge-output-format mp4)
+    [[ -n "$MAX_HEIGHT" ]] && cmd+=(-S "res:${MAX_HEIGHT}")
+  fi
+
+  [[ -n "$COOKIES" ]] && cmd+=(--cookies-from-browser "$COOKIES")
+  (( VERBOSE )) && cmd+=(-v)
+
+  if (( DRY_RUN )); then
+    printf '[dry-run] '
+    printf '%q ' "${cmd[@]}" "$url"
+    echo
+    return 0
+  fi
+
+  log "downloading: $url"
+  if ! file=$("${cmd[@]}" --print after_move:filepath "$url"); then
+    warn "yt-dlp failed for $url"
+    return 1
+  fi
+  file=$(printf '%s\n' "$file" | tail -n 1)
+  [[ -f "$file" ]] || { warn "could not locate output file for $url"; return 1; }
+
+  if (( WHATSAPP )) && (( ! AUDIO_ONLY )); then
+    file=$(to_whatsapp "$file") || return 1
+  fi
+
+  local size
+  size=$(size_mb "$file")
+  log "saved: $file (${size} MB)"
+  (( size > WA_MAX_MB )) && warn "file is ${size} MB, above WhatsApp's ~${WA_MAX_MB} MB limit"
+  return 0
+}
+
+# ---------- main ----------
+main() {
+  local opt
+  while getopts ":o:n:p:wr:q:F:ac:kdi:vhV" opt; do
+    case "$opt" in
+      o) OUTDIR="$OPTARG" ;;
+      n) NAME="$OPTARG" ;;
+      p) PREFIX="$OPTARG" ;;
+      w) WHATSAPP=1 ;;
+      r) MAX_HEIGHT="$OPTARG" ;;
+      q) CRF="$OPTARG" ;;
+      F) FORMAT="$OPTARG" ;;
+      a) AUDIO_ONLY=1 ;;
+      c) COOKIES="$OPTARG" ;;
+      k) KEEP_ORIGINAL=1 ;;
+      d) DRY_RUN=1 ;;
+      i) INPUT_FILE="$OPTARG" ;;
+      v) VERBOSE=1 ;;
+      h) usage; exit 0 ;;
+      V) echo "igdl.sh $VERSION"; exit 0 ;;
+      :) die "option -$OPTARG requires an argument" ;;
+      \?) die "unknown option -$OPTARG (see -h)" ;;
+    esac
+  done
+  shift $((OPTIND - 1))
+  URLS+=("$@")
+
+  if [[ -n "$INPUT_FILE" ]]; then
+    [[ -r "$INPUT_FILE" ]] || die "cannot read $INPUT_FILE"
+    while IFS= read -r line; do
+      line="${line%%#*}"
+      line="${line//[[:space:]]/}"
+      [[ -n "$line" ]] && URLS+=("$line")
+    done < "$INPUT_FILE"
+  fi
+
+  (( ${#URLS[@]} > 0 )) || { usage; exit 1; }
+  [[ -n "$MAX_HEIGHT" && ! "$MAX_HEIGHT" =~ ^[0-9]+$ ]] && die "-r expects a number"
+  [[ ! "$CRF" =~ ^[0-9]+$ ]] && die "-q expects a number"
+
+  check_deps
+  (( DRY_RUN )) || mkdir -p "$OUTDIR"
+
+  local i=0 failed=0 ok=0
+  for url in "${URLS[@]}"; do
+    i=$((i + 1))
+    if process_url "$url" "$i"; then
+      ok=$((ok + 1))
+    else
+      failed=$((failed + 1))
+    fi
+  done
+
+  log "finished: ${ok} succeeded, ${failed} failed"
+  (( failed == 0 )) || exit 1
+}
+
+main "$@"
